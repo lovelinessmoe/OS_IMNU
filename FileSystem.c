@@ -1,6 +1,5 @@
 //
 // Created by loveliness on 2021/12/6.
-// 1
 //
 
 #include <stdio.h>
@@ -27,6 +26,7 @@
 #define DELIM           "/"
 #define FOLDER_COLOR    "\e[1;32m"
 #define DEFAULT_COLOR   "\e[0m"
+#define WRITE_SIZE      20 * BLOCK_SIZE
 
 /**
  * @brief 存储虚拟磁盘信息。
@@ -117,9 +117,21 @@ int my_rm(char **args);
 
 void do_rm(fcb *file);
 
+int my_open(char **args);
+
 int do_open(char *path);
 
+int my_close(char **args);
+
 void do_close(int fd);
+
+int my_write(char **args);
+
+int do_write(int fd, char *content, size_t len, int wstyle);
+
+int my_read(char **args);
+
+int do_read(int fd, int len, char *text);
 
 int my_exit_sys();
 
@@ -154,6 +166,12 @@ char *trans_date(char *sdate, unsigned short date);
 char *trans_time(char *stime, unsigned short time);
 
 #endif //OPERATOR_SYSTEM_EXP4_SIMPLEFS_H
+
+
+/**
+ * FAT16 文件系统中的定义。
+ * 宏定义，FCB 和 FAT 等结构，以及一些全局变量。
+ */
 
 /**
  * 启动文件系统和初始变量。
@@ -768,6 +786,65 @@ void do_rm(fcb *file) {
 }
 
 /**
+ * 打开文件。
+ * @param args '-l' 显示所有打开的文件。 “路径”打开文件。
+ * @return 总是 1。
+ */
+int my_open(char **args) {
+    int i, j;
+    fcb *file;
+    char path[PATHLENGTH];
+
+    if (args[1] == NULL) {
+        fprintf(stderr, "open: missing operand\n");
+        return 1;
+    }
+    if (args[1][0] == '-') {
+        if (!strcmp(args[1], "-l")) {
+            printf("fd filename exname state path\n");
+            for (i = 0; i < MAX_OPENFILE; i++) {
+                if (openfile_list[i].free == 0) {
+                    continue;
+                }
+
+                printf("%2d %8s %-6s %-5d %s\n", i, openfile_list[i].open_fcb.filename,
+                       openfile_list[i].open_fcb.exname,
+                       openfile_list[i].fcb_state, openfile_list[i].dir);
+            }
+            return 1;
+        } else {
+            fprintf(stderr, "open: wrong argument\n");
+            return 1;
+        }
+    }
+
+    for (i = 1; args[i] != NULL; i++) {
+        file = find_fcb(args[i]);
+        if (file == NULL) {
+            fprintf(stderr, "open: cannot open %s: No such file or folder\n", args[i]);
+            return 1;
+        }
+
+        /**< 检查文件是否存在于 openfile_list 中。 */
+        for (j = 0; j < MAX_OPENFILE; j++) {
+            if (openfile_list[j].free == 0) {
+                continue;
+            }
+
+            if (!strcmp(file->filename, openfile_list[j].open_fcb.filename) &&
+                file->first == openfile_list[j].open_fcb.first) {
+                /**< file is open. */
+                fprintf(stderr, "open: cannot open %s: File or folder is open\n", args[i]);
+                continue;
+            }
+        }
+
+        do_open(get_abspath(path, args[i]));
+    }
+    return 1;
+}
+
+/**
  * 只需打开文件。
  * @param path 要打开的文件的绝对路径..
  * @return 错误为 -1，否则返回 fd;
@@ -789,6 +866,58 @@ int do_open(char *path) {
     return fd;
 }
 
+/**
+ * 关闭文件并保存。
+ * @param args '-a' 关闭所有文件。 'path' 关闭文件。
+ * @return 总是 1。
+ */
+int my_close(char **args) {
+    int i, j;
+    fcb *file;
+
+    /**< Check argument count. */
+    if (args[1] == NULL) {
+        fprintf(stderr, "close: missing operand\n");
+        return 1;
+    }
+    if (args[1][0] == '-') {
+        if (!strcmp(args[1], "-a")) {
+            for (i = 0; i < MAX_OPENFILE; i++) {
+                if (i == curdir) {
+                    continue;
+                }
+                openfile_list[i].free = 0;
+            }
+            return 1;
+        } else {
+            fprintf(stderr, "close: wrong argument\n");
+            return 1;
+        }
+    }
+
+
+    for (i = 1; args[i] != NULL; i++) {
+        file = find_fcb(args[i]);
+        if (file == NULL) {
+            fprintf(stderr, "close: cannot close %s: No such file or folder\n", args[i]);
+            return 1;
+        }
+
+        /**< 检查文件是否存在于 openfile_list 中。*/
+        for (j = 0; j < MAX_OPENFILE; j++) {
+            if (openfile_list[j].free == 0) {
+                continue;
+            }
+
+            if (!strcmp(file->filename, openfile_list[j].open_fcb.filename) &&
+                file->first == openfile_list[j].open_fcb.first) {
+                /**< File is open. */
+                do_close(j);
+            }
+        }
+    }
+    return 1;
+}
 
 /**
  * 只需关闭文件。
@@ -799,6 +928,302 @@ void do_close(int fd) {
         fcb_cpy(find_fcb(openfile_list[fd].dir), &openfile_list[fd].open_fcb);
     }
     openfile_list[fd].free = 0;
+}
+
+/**
+ * 写文件。 @param args [-a|-c|-w] append|cover|write, 'path' 文件路径。
+ */
+int my_write(char **args) {
+    int i, j = 0, flag = 0;
+    int mode = 'w';
+    char c;
+    char path[PATHLENGTH];
+    char str[WRITE_SIZE];
+    fcb *file;
+
+    /**< 检查参数计数。 */
+    for (i = 1; args[i] != NULL; i++) {
+        if (args[i][0] == '-') {
+            if (!strcmp(args[i], "-w")) {
+                mode = 'w';
+            } else if (!strcmp(args[i], "-c")) {
+                mode = 'c';
+            } else if (!strcmp(args[i], "-a")) {
+                mode = 'a';
+            } else {
+                fprintf(stderr, "write: wrong argument\n");
+                return 1;
+            }
+        } else {
+            flag += 1 << i;
+        }
+    }
+    if ((flag == 0) || (flag > 4) || i > 3) {
+        fprintf(stderr, "write: wrong argument\n");
+        return 1;
+    }
+
+    /**< 检查它是文件还是文件夹。 */
+    strcpy(path, args[flag >> 1]);
+    if ((file = find_fcb(path)) == NULL) {
+        fprintf(stderr, "write: File not exists\n");
+        return 1;
+    }
+    if (file->attribute == 0) {
+        fprintf(stderr, "write: cannot access a folder\n");
+        return 1;
+    }
+
+    memset(str, '\0', WRITE_SIZE);
+    /**< 检查它是否打开。 */
+    for (i = 0; i < MAX_OPENFILE; i++) {
+        if (openfile_list[i].free == 0) {
+            continue;
+        }
+
+        if (!strcmp(file->filename, openfile_list[i].open_fcb.filename) &&
+            file->first == openfile_list[i].open_fcb.first) {
+            /**< File is open. */
+            if (mode == 'c') {
+                printf("Please input location: ");
+                scanf("%d", &openfile_list[i].count);
+                getchar();
+            }
+            while (1) {
+                for (; (str[j] = getchar()) != '\n'; j++);
+                j++;
+                if ((c = getchar()) == '\n') {
+                    break;
+                } else {
+                    str[j] = c;
+                    j++;
+                }
+            }
+
+            if (mode == 'c') {
+                do_write(i, str, j - 1, mode);
+            } else {
+                do_write(i, str, j + 1, mode);
+            }
+
+            return 1;
+        }
+    }
+
+    fprintf(stderr, "write: file is not open\n");
+    return 1;
+}
+
+/**
+ * @param fd 文件描述符。
+ * @param wstyle 写风格。
+ * @return 字节写入
+ */
+int do_write(int fd, char *content, size_t len, int wstyle) {
+    //fat1表
+
+    fat *fat1 = (fat *) (fs_head + BLOCK_SIZE);
+    fat *fat2 = (fat *) (fs_head + 3 * BLOCK_SIZE);
+
+    //定义输入字符串数组，初始化
+    char text[WRITE_SIZE] = {0};
+
+    int write = openfile_list[fd].count;
+    openfile_list[fd].count = 0;
+    do_read(fd, openfile_list[fd].open_fcb.length, text);  //读取
+    openfile_list[fd].count = write;
+
+    int i = openfile_list[fd].open_fcb.first;
+
+    char input[WRITE_SIZE] = {0};
+    strncpy(input, content, len);
+    //文件处理：截断写、覆盖写、追加写
+    if (wstyle == 'w') {
+        memset(text, 0, WRITE_SIZE);
+        memcpy(text, input, len);
+//        strncpy(text, input, len);
+    } else if (wstyle == 'c') {
+        memcpy(text + openfile_list[fd].count, input, len);
+//        strncpy(&text[openfile_list[fd].count], input, len);
+    } else if (wstyle == 'a') {
+        memcpy(text + openfile_list[fd].count, input, len);
+//        strncpy(&text[openfile_list[fd].open_fcb.length], input, len);
+    }
+    //写入文件系统
+    int length = strlen(text); //需要写入的长度
+    int num = length / BLOCK_SIZE + 1;
+    int static_num = num;
+
+    while (num) {
+        char buf[BLOCK_SIZE] = {0};
+        memcpy(buf, &text[(static_num - num) * BLOCK_SIZE], BLOCK_SIZE);
+        unsigned char *p = fs_head + i * BLOCK_SIZE;
+        memcpy(p, buf, BLOCK_SIZE);
+        num = num - 1;
+        if (num > 0) // 是否还有下一次循环
+        {
+            fat *fat_cur = fat1 + i;
+
+            if (fat_cur->id == END)  //需要申请索引块
+            {
+                int next = get_free(1);
+                fat_cur->id = next;
+                fat_cur = fat1 + next;
+                fat_cur->id = END;
+            }
+            i = (fat1 + i)->id;
+        }
+    }
+    //这时的i是刚写完的最后一个磁盘块，剩下的磁盘块可以free掉
+
+    if (fat1[i].id != END) {
+        int j = fat1[i].id;
+        fat1[i].id = END;
+        i = j;
+        while (fat1[i].id != END) {
+            int m = fat1[i].id;
+            fat1[i].id = FREE;
+            i = m;
+        }
+        fat1[i].id = FREE;
+    }
+
+    memcpy(fat2, fat1, 2 * BLOCK_SIZE);
+    openfile_list[fd].open_fcb.length = length;
+    openfile_list[fd].fcb_state = 1;
+    return (strlen(input));
+
+
+}
+
+/**
+ * 读取文件。
+ * @param args [-s|-a] select|all, 'path' 文件路径。
+ * @return 读取的字节数。
+ */
+int my_read(char **args) {
+    int i, flag = 0;
+    int length;
+    int mode = 'a';
+    char path[PATHLENGTH];
+    char str[WRITE_SIZE];
+    fcb *file;
+
+    /**< 检查参数计数。*/
+    for (i = 1; args[i] != NULL; i++) {
+        if (args[i][0] == '-') {
+            if (!strcmp(args[i], "-s")) {
+                mode = 's';
+            } else if (!strcmp(args[i], "-a")) {
+                mode = 'a';
+            } else {
+                fprintf(stderr, "read: wrong argument\n");
+                return 1;
+            }
+        } else {
+            flag += 1 << i;
+        }
+    }
+    if ((flag == 0) || (flag > 4) || i > 3) {
+        fprintf(stderr, "read: wrong argument\n");
+        return 1;
+    }
+
+    /**< 检查它是文件还是文件夹。 */
+    strcpy(path, args[flag >> 1]);
+    if ((file = find_fcb(path)) == NULL) {
+        fprintf(stderr, "read: File not exists\n");
+        return 1;
+    }
+    if (file->attribute == 0) {
+        fprintf(stderr, "read: cannot access a folder\n");
+        return 1;
+    }
+
+    memset(str, '\0', WRITE_SIZE);
+    /**<检查它是否打开。 */
+    for (i = 0; i < MAX_OPENFILE; i++) {
+        if (openfile_list[i].free == 0) {
+            continue;
+        }
+
+        if (!strcmp(file->filename, openfile_list[i].open_fcb.filename) &&
+            file->first == openfile_list[i].open_fcb.first) {
+            /**< 文件已打开。 */
+            if (mode == 'a') {
+                openfile_list[i].count = 0;
+                length = UINT16_MAX;
+            }
+            if (mode == 's') {
+                printf("Please input location: ");
+                scanf("%d", &openfile_list[i].count);
+                printf("Please input length: ");
+                scanf("%d", &length);
+                printf("-----------------------\n");
+            }
+            do_read(i, length, str);
+            fputs(str, stdout);
+            return 1;
+        }
+    }
+
+    fprintf(stderr, "read: file is not open\n");
+    return 1;
+}
+
+/**
+ * @param fd 文件描述符。
+ * @param len 文本长度。
+ * @param text 将文件读入文本。
+ */
+int do_read(int fd, int len, char *text) {
+    memset(text, '\0', BLOCK_SIZE * 20);
+
+    if (len <= 0) //想要读取0个字符
+    {
+        return 0;
+    }
+
+    fat *fat1 = (fat *) (fs_head + BLOCK_SIZE); //FAT1表
+    int location = 0;//text的写入位置
+    int length;
+    int count = openfile_list[fd].count; //读写指针位置
+    //排除了id出现end的情况
+    if ((openfile_list[fd].open_fcb.length - count) >= len) //可以读取的字符多于想要读取的字符
+    {
+        length = len;  //想要读取的字符
+    } else {
+        length = openfile_list[fd].open_fcb.length - count; //只能读取这些字符
+    }
+    while (length) //需要读取的字符串个数
+    {
+        char *buf = (char *) malloc(BLOCK_SIZE); //申请空闲缓冲区
+        int count = openfile_list[fd].count; //读写指针位置
+        int logic_block_num = count / BLOCK_SIZE;//逻辑块号（起始为0）
+        int off = count % BLOCK_SIZE;//块内偏移量
+        int physics_block_num = openfile_list[fd].open_fcb.first;//文件起始物理块号（引导块号为0）
+
+        for (int i = 0; i < logic_block_num; i++)  //物理块号
+        {
+            physics_block_num = (fat1 + physics_block_num)->id; //FAT第一项为0，若为1则physics_block_num-1
+        }
+        unsigned char *p = fs_head + BLOCK_SIZE * physics_block_num; //该物理块起始地址
+        memcpy(buf, p, BLOCK_SIZE);
+
+        if ((off + length) <= BLOCK_SIZE) {
+            memcpy(&text[location], &buf[off], length);
+            openfile_list[fd].count = openfile_list[fd].count + length;
+            location += length;  //下一次写的位置
+            length = length - length;  //lenght = 0 将退出循环
+        } else {
+            memcpy(&text[location], &buf[off], BLOCK_SIZE - off);
+            openfile_list[fd].count += BLOCK_SIZE - off;
+            location += BLOCK_SIZE - off;
+            length = length - BLOCK_SIZE - off; //还剩下的想要读取的字节数
+        }
+    }
+
+    return location;
 }
 
 /**
@@ -1177,7 +1602,11 @@ char *builtin_str[] = {
         "ls",
         "create",
         "rm",
+        "write",
+        "read",
         "exit",
+        "open",
+        "close",
         "pwd"
 };
 
@@ -1189,7 +1618,11 @@ int (*builtin_func[])(char **) = {
         &my_ls,
         &my_create,
         &my_rm,
+        &my_write,
+        &my_read,
         &my_exit_sys,
+        &my_open,
+        &my_close,
         &my_pwd
 };
 
